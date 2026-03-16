@@ -2067,32 +2067,48 @@ class GiteeAIImagePlugin(Star):
         )
 
     async def _finalize_llm_tool_image(
-        self,
-        event: AstrMessageEvent,
-        image_path: Path,
+            self, event: AstrMessageEvent, image_path: Path,
     ) -> mcp.types.CallToolResult | None:
+        """
+        构建返回给LLM上下文的图片结果。
+
+        流程：
+        1. 记录最后生成的图片路径（用于 /重发图片）
+        2. 发送无损原图给用户
+        3. 如果启用，返回压缩图给LLM上下文
+
+        注意：
+        - 用户始终看到的是无损原图
+        - LLM拿到的是压缩图（适配模型输入限制）
+        """
+        # 1. 记录图片路径
         self._remember_last_image(event, image_path)
 
-        if self._is_llm_tool_image_context_enabled():
-            await self._ensure_tool_image_cache_dir()
-            result = await self._build_llm_tool_image_result(image_path)
-            if result is not None:
-                await mark_success(event)
-                return result
-            logger.warning(
-                "[aiimg_generate] fallback to direct send after LLM image result build failed"
-            )
-
+        # 2. ✅ 关键：无论如何都要先发送无损原图给用户
         sent = await self._send_image_with_fallback(event, image_path)
         if not sent:
             await mark_failed(event)
             logger.warning(
-                "[aiimg_generate] image send failed, emoji fallback only: reason=%s",
+                "[aiimg_generate] 无损原图发送失败，已使用表情标注: reason=%s",
                 sent.reason,
             )
             return None
 
+        # 标记成功（用户已看到原图）
         await mark_success(event)
+
+        # 3. 如果启用了返回图片到LLM上下文，返回压缩图
+        if self._is_llm_tool_image_context_enabled():
+            await self._ensure_tool_image_cache_dir()
+            result = await self._build_llm_tool_image_result(image_path)
+            if result is not None:
+                # 返回压缩图给LLM，用于生成回复
+                return result
+            logger.warning(
+                "[aiimg_generate] LLM上下文图片构建失败，降级为无图回复"
+            )
+
+        # 4. 如果没启用或构建失败，返回None（LLM只会回复文本）
         return None
 
     def _get_selfie_ref_store_key(self, event: AstrMessageEvent) -> str:

@@ -302,6 +302,55 @@ class GiteeAIImagePlugin(Star):
             return None
         return None
 
+    @staticmethod
+    def _compress_for_llm_context(
+            image_path: Path, max_side: int = 2048, quality: int = 85
+    ) -> bytes | None:
+        """
+        为LLM上下文压缩图片（保持比例，限制最大边长）。
+        原图保持不变，仅压缩回传给LLM的副本。
+        """
+        try:
+            from PIL import Image as PILImage
+        except Exception:
+            return None
+        try:
+            with PILImage.open(image_path) as im:
+                # 转换为RGB
+                if im.mode not in {"RGB", "L"}:
+                    im = im.convert("RGB")
+                elif im.mode == "L":
+                    im = im.convert("RGB")
+                w, h = im.size
+                if w <= 0 or h <= 0:
+                    return None
+
+                # 如果尺寸合规，直接返回原图字节
+                if w <= max_side and h <= max_side:
+                    try:
+                        return image_path.read_bytes()
+                    except Exception:
+                        pass
+
+                # 等比例缩放
+                scale = min(max_side / w, max_side / h)
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                resampling = getattr(
+                    getattr(PILImage, "Resampling", PILImage), "LANCZOS"
+                )
+                im_resized = im.resize((new_w, new_h), resampling)
+
+                # 保存为JPEG
+                out = io.BytesIO()
+                im_resized.save(out, format="JPEG", quality=quality, optimize=True)
+                return out.getvalue()
+        except Exception as e:
+            logger.warning(
+                "[compress_for_llm] 图片压缩失败: path=%s, err=%s", image_path, e
+            )
+            return None
+
     def _is_selfie_enabled(self) -> bool:
         conf = self._get_feature("selfie")
         return self._as_bool(conf.get("enabled", True), default=True)
@@ -1966,13 +2015,33 @@ class GiteeAIImagePlugin(Star):
         await asyncio.to_thread(tool_image_dir.mkdir, parents=True, exist_ok=True)
 
     async def _build_llm_tool_image_result(
-        self, image_path: Path
+            self, image_path: Path
     ) -> mcp.types.CallToolResult | None:
+        """
+        构建返回给LLM上下文的图片结果。
+        【关键】原图保持无损发给用户，仅压缩回传给LLM的副本。
+        """
         try:
-            image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
+            # 优先压缩图片（适配LLM输入限制）
+            compressed_bytes = await asyncio.to_thread(
+                self._compress_for_llm_context, image_path, max_side=2048, quality=85
+            )
+            if compressed_bytes:
+                image_bytes = compressed_bytes
+                logger.debug(
+                    "[aiimg_generate] 已压缩图片回传LLM: path=%s, compressed_size=%d bytes",
+                    image_path,
+                    len(image_bytes)
+                )
+            else:
+                # 压缩失败，降级使用原图
+                image_bytes = await asyncio.to_thread(Path(image_path).read_bytes)
+                logger.warning(
+                    "[aiimg_generate] 压缩失败，使用原图回传LLM: path=%s", image_path
+                )
         except Exception as exc:
             logger.warning(
-                "[aiimg_generate] failed to read image for LLM context: path=%s err=%s",
+                "[aiimg_generate] 读取图片失败: path=%s err=%s",
                 image_path,
                 exc,
             )
@@ -1980,7 +2049,7 @@ class GiteeAIImagePlugin(Star):
 
         if not image_bytes:
             logger.warning(
-                "[aiimg_generate] skip empty image for LLM context: path=%s",
+                "[aiimg_generate] 跳过空图片: path=%s",
                 image_path,
             )
             return None
